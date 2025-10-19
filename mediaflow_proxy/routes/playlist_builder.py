@@ -43,7 +43,7 @@ def rewrite_m3u_links_streaming(m3u_lines_iterator: Iterator[str], base_url: str
                         current_ext_headers[header_key] = header_value
                     elif key_vlc.startswith('http-'):
                         # Gestisce http-user-agent, http-referer etc.
-                        header_key = '-'.join(word.capitalize() for word in key_vlc[len('http-'):].split('-'))
+                        header_key = key_vlc[len('http-'):]
                         current_ext_headers[header_key] = value_vlc
             except Exception as e:
                 logger.error(f"⚠️ Error parsing #EXTVLCOPT '{logical_line}': {e}")
@@ -59,7 +59,6 @@ def rewrite_m3u_links_streaming(m3u_lines_iterator: Iterator[str], base_url: str
                 current_ext_headers = {}  # Resetta in caso di errore
 
         if is_header_tag:
-            yield line_with_newline
             continue
         
         if logical_line and not logical_line.startswith('#') and \
@@ -75,7 +74,7 @@ def rewrite_m3u_links_streaming(m3u_lines_iterator: Iterator[str], base_url: str
                 processed_url_content = f"{base_url}/proxy/hls/manifest.m3u8?d={encoded_url}"
             elif 'vixsrc.to' in logical_line:
                 encoded_url = urllib.parse.quote(logical_line, safe='')
-                processed_url_content = f"{base_url}/extractor/video?host=VixCloud&redirect_stream=true&d={encoded_url}"
+                processed_url_content = f"{base_url}/extractor/video?host=VixCloud&redirect_stream=true&d={encoded_url}&max_res=true&no_proxy=true"
             elif '.m3u8' in logical_line:
                 encoded_url = urllib.parse.quote(logical_line, safe='')
                 processed_url_content = f"{base_url}/proxy/hls/manifest.m3u8?d={encoded_url}"
@@ -166,33 +165,45 @@ async def async_download_m3u_playlist(url: str) -> list[str]:
 
 async def async_generate_combined_playlist(playlist_definitions: list[str], base_url: str, api_password: Optional[str]):
     """Genera una playlist combinata da multiple definizioni, scaricando in parallelo."""
-    # Prepara gli URL
-    playlist_urls = []
+    # Prepara i task di download
+    download_tasks = []
     for definition in playlist_definitions:
-        if '&' in definition:
-            parts = definition.split('&', 1)
-            playlist_url_str = parts[1] if len(parts) > 1 else parts[0]
-        else:
-            playlist_url_str = definition
-        playlist_urls.append(playlist_url_str)
+        should_proxy = True
+        playlist_url_str = definition
+
+        if definition.startswith('no_proxy:'):
+            should_proxy = False
+            playlist_url_str = definition[len('no_proxy:'):]
+        
+        download_tasks.append({
+            "url": playlist_url_str,
+            "proxy": should_proxy
+        })
 
     # Scarica tutte le playlist in parallelo
-    results = await asyncio.gather(*[async_download_m3u_playlist(url) for url in playlist_urls], return_exceptions=True)
+    results = await asyncio.gather(*[async_download_m3u_playlist(task["url"]) for task in download_tasks], return_exceptions=True)
 
     first_playlist_header_handled = False
     for idx, lines in enumerate(results):
+        task_info = download_tasks[idx]
         if isinstance(lines, Exception):
-            yield f"# ERROR processing playlist {playlist_urls[idx]}: {str(lines)}\n"
+            yield f"# ERROR processing playlist {task_info['url']}: {str(lines)}\n"
             continue
+        
         playlist_lines: list[str] = lines  # type: ignore
         current_playlist_had_lines = False
         first_line_of_this_segment = True
-        lines_processed_for_current_playlist = 0
-        rewritten_lines_iter = rewrite_m3u_links_streaming(iter(playlist_lines), base_url, api_password)
-        for line in rewritten_lines_iter:
+        
+        # Scegli se riscrivere i link o meno
+        if task_info["proxy"]:
+            lines_iterator = rewrite_m3u_links_streaming(iter(playlist_lines), base_url, api_password)
+        else:
+            lines_iterator = iter(playlist_lines)
+
+        for line in lines_iterator:
             current_playlist_had_lines = True
             is_extm3u_line = line.strip().startswith('#EXTM3U')
-            lines_processed_for_current_playlist += 1
+            
             if not first_playlist_header_handled:
                 yield line
                 if is_extm3u_line:
